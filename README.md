@@ -52,6 +52,5 @@ ESP8266-WiFi-Controlled-Robot/
 ├── README.md
 ├── robot.ino
 ├── images/
-├── video/
 └── report/
 
