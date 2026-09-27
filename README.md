@@ -47,10 +47,11 @@ The ESP8266 is programmed using the Arduino programming environment.
 
 ## Project Structure
 
-```text
 ESP8266-WiFi-Controlled-Robot/
 │
 ├── README.md
 ├── robot.ino
 ├── images/
-└── ...
+└── video/
+    └── robot_test.mp4
+
