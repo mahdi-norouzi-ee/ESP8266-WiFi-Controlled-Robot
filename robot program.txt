@@ -1,0 +1,1081 @@
+/*
+
+  CONTROL 
+  --------------------
+  W      -> Forward
+  S      -> Backward
+  SPACE  -> Stop
+
+
+  Wi-Fi:
+  ------
+  SSID     : Robot_ESP8266
+  Password : Robot1234
+  IP       : 192.168.4.1
+
+
+ ==============================================================
+                     HARDWARE CONNECTION
+ ==============================================================
+
+  L298N              ESP8266
+
+  ENA   ------------> D1
+  IN1   ------------> D2
+  IN2   ------------> D5
+  IN3   ------------> D6
+  IN4   ------------> D7
+  ENB   ------------> D8
+
+*/
+
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+
+// =============================================================
+// 1. PIN CONFIGURATION
+// =============================================================
+
+const uint8_t ENA = D1;
+const uint8_t IN1 = D2;
+const uint8_t IN2 = D5;
+
+const uint8_t IN3 = D6;
+const uint8_t IN4 = D7;
+const uint8_t ENB = D8;
+
+
+// =============================================================
+// 2. WI-FI CONFIGURATION
+// =============================================================
+
+const char* WIFI_SSID = "Robot_ESP8266";
+const char* WIFI_PASSWORD = "Robot1234";
+
+ESP8266WebServer server(80);
+
+
+// =============================================================
+// 3. MOTOR SAFETY SETTINGS
+// =============================================================
+
+// ESP8266 PWM range = 0 ... 1023
+//
+// We intentionally do NOT use maximum PWM.
+//
+// This is a SOFTWARE LIMIT, not a guarantee of hardware safety.
+
+const int MAX_PWM = 600;
+
+
+// Target speed.
+// Robot will gradually reach this value.
+
+const int TARGET_PWM = 500;
+
+
+// How quickly the motors accelerate.
+
+const int ACCELERATION_STEP = 8;
+
+
+// How quickly the motors decelerate.
+
+const int DECELERATION_STEP = 10;
+
+
+// Time between acceleration/deceleration steps.
+
+const unsigned long RAMP_INTERVAL = 25;
+
+
+// Safety delay before changing direction.
+
+const unsigned long DIRECTION_DELAY = 250;
+
+
+// =============================================================
+// 4. WI-FI SAFETY TIMEOUT
+// =============================================================
+//
+// Laptop continuously sends a heartbeat.
+//
+// If the ESP8266 does not receive a valid command/heartbeat
+// for this amount of time, the robot automatically stops.
+//
+// This is VERY important for wireless control.
+//
+
+const unsigned long WIFI_TIMEOUT = 700;
+
+
+// =============================================================
+// 5. COMMAND / MOTOR STATE
+// =============================================================
+
+enum RobotDirection
+{
+  ROBOT_STOPPED,
+  ROBOT_FORWARD,
+  ROBOT_BACKWARD
+};
+
+
+RobotDirection currentDirection = ROBOT_STOPPED;
+
+RobotDirection requestedDirection = ROBOT_STOPPED;
+
+
+int currentPWM = 0;
+
+
+unsigned long lastRampTime = 0;
+
+unsigned long lastCommunication = 0;
+
+unsigned long directionStopTime = 0;
+
+
+// =============================================================
+// 6. MOTOR DIRECTION
+// =============================================================
+
+void setMotorDirection(RobotDirection direction)
+{
+  if (direction == ROBOT_FORWARD)
+  {
+    /*
+       Motor A
+    */
+
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+
+
+    /*
+       Motor B
+    */
+
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  }
+
+
+  else if (direction == ROBOT_BACKWARD)
+  {
+    /*
+       Motor A
+    */
+
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+
+
+    /*
+       Motor B
+    */
+
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  }
+
+
+  else
+  {
+    /*
+       STOP
+    */
+
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+  }
+}
+
+
+// =============================================================
+// 7. APPLY PWM
+// =============================================================
+
+void applyPWM(int pwm)
+{
+  /*
+     SOFTWARE SAFETY LIMIT
+  */
+
+  pwm = constrain(pwm, 0, MAX_PWM);
+
+
+  analogWrite(ENA, pwm);
+  analogWrite(ENB, pwm);
+
+
+  currentPWM = pwm;
+}
+
+
+// =============================================================
+// 8. EMERGENCY STOP
+// =============================================================
+//
+// This function is used when the program detects an unsafe
+// software state.
+//
+// =============================================================
+
+void emergencyStop()
+{
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+
+  currentPWM = 0;
+
+  currentDirection = ROBOT_STOPPED;
+
+  requestedDirection = ROBOT_STOPPED;
+}
+
+
+// =============================================================
+// 9. SOFT STOP
+// =============================================================
+//
+// The robot does not suddenly stop.
+// PWM gradually decreases to zero.
+//
+// =============================================================
+
+void softStop()
+{
+  unsigned long now = millis();
+
+
+  if (now - lastRampTime >= RAMP_INTERVAL)
+  {
+    lastRampTime = now;
+
+
+    currentPWM -= DECELERATION_STEP;
+
+
+    if (currentPWM < 0)
+    {
+      currentPWM = 0;
+    }
+
+
+    applyPWM(currentPWM);
+
+
+    /*
+       Once PWM reaches zero,
+       disable direction signals.
+    */
+
+    if (currentPWM == 0)
+    {
+      setMotorDirection(ROBOT_STOPPED);
+
+      currentDirection = ROBOT_STOPPED;
+
+      directionStopTime = millis();
+    }
+  }
+}
+
+
+// =============================================================
+// 10. START MOVEMENT
+// =============================================================
+
+void startMovement(RobotDirection direction)
+{
+  /*
+     If already moving in requested direction,
+     nothing needs to change.
+  */
+
+  if (currentDirection == direction)
+  {
+    return;
+  }
+
+
+  /*
+     If moving in another direction:
+
+       MOVE
+         ?
+       STOP
+         ?
+       WAIT
+         ?
+       NEW DIRECTION
+
+     This prevents direct forward -> backward switching.
+  */
+
+  if (currentDirection != ROBOT_STOPPED)
+  {
+    requestedDirection = direction;
+
+    softStop();
+
+    return;
+  }
+
+
+  /*
+     Safety delay after stopping.
+  */
+
+  if (millis() - directionStopTime < DIRECTION_DELAY)
+  {
+    return;
+  }
+
+
+  /*
+     Set the new direction.
+  */
+
+  setMotorDirection(direction);
+
+
+  currentDirection = direction;
+
+  currentPWM = 0;
+
+  applyPWM(0);
+
+  lastRampTime = millis();
+}
+
+
+// =============================================================
+// 11. ACCELERATION
+// =============================================================
+
+void accelerate()
+{
+  if (currentDirection == ROBOT_STOPPED)
+  {
+    return;
+  }
+
+
+  if (currentPWM >= TARGET_PWM)
+  {
+    return;
+  }
+
+
+  if (millis() - lastRampTime >= RAMP_INTERVAL)
+  {
+    lastRampTime = millis();
+
+
+    currentPWM += ACCELERATION_STEP;
+
+
+    if (currentPWM > TARGET_PWM)
+    {
+      currentPWM = TARGET_PWM;
+    }
+
+
+    applyPWM(currentPWM);
+  }
+}
+
+
+// =============================================================
+// 12. PROCESS MOVEMENT
+// =============================================================
+
+void processMovement()
+{
+  /*
+     If a new direction has been requested
+     while the robot was moving,
+     wait until the robot has completely stopped.
+  */
+
+  if (currentDirection == ROBOT_STOPPED)
+  {
+    if (requestedDirection != ROBOT_STOPPED)
+    {
+      startMovement(requestedDirection);
+    }
+
+    return;
+  }
+
+
+  /*
+     Requested STOP
+  */
+
+  if (requestedDirection == ROBOT_STOPPED)
+  {
+    softStop();
+
+    return;
+  }
+
+
+  /*
+     Requested direction is different from current direction.
+  */
+
+  if (requestedDirection != currentDirection)
+  {
+    softStop();
+
+    return;
+  }
+
+
+  /*
+     Same direction:
+     gradually accelerate to target speed.
+  */
+
+  accelerate();
+}
+
+
+// =============================================================
+// 13. HTML CONTROL PAGE
+// =============================================================
+
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<title>ESP8266 Robot</title>
+
+
+<style>
+
+body
+{
+  background: #111;
+  color: white;
+
+  font-family: Arial;
+
+  text-align: center;
+
+  margin: 0;
+
+  padding: 20px;
+}
+
+
+h1
+{
+  margin-bottom: 10px;
+}
+
+
+#status
+{
+  font-size: 20px;
+
+  margin: 20px;
+
+  padding: 10px;
+
+  border-radius: 10px;
+
+  background: #222;
+}
+
+
+button
+{
+  width: 140px;
+
+  height: 80px;
+
+  margin: 8px;
+
+  font-size: 25px;
+
+  border-radius: 15px;
+
+  border: none;
+}
+
+
+.stop
+{
+  font-weight: bold;
+}
+
+
+.info
+{
+  margin-top: 20px;
+
+  font-size: 16px;
+
+  color: #ccc;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<h1>?? Robot Control</h1>
+
+
+<div id="status">
+STOP
+</div>
+
+
+<div>
+
+<button
+  onmousedown="startCommand('forward')"
+  onmouseup="stopCommand()"
+  ontouchstart="startCommand('forward')"
+  ontouchend="stopCommand()">
+
+  ? FORWARD
+
+</button>
+
+</div>
+
+
+<div>
+
+<button
+  onmousedown="startCommand('backward')"
+  onmouseup="stopCommand()"
+  ontouchstart="startCommand('backward')"
+  ontouchend="stopCommand()">
+
+  ? BACKWARD
+
+</button>
+
+
+<button
+  class="stop"
+  onclick="stopCommand()">
+
+  STOP
+
+</button>
+
+</div>
+
+
+<div class="info">
+
+W = Forward<br>
+S = Backward<br>
+SPACE = Stop
+
+</div>
+
+
+<script>
+
+
+let activeCommand = "stop";
+
+let timer = null;
+
+
+function sendCommand(command)
+{
+  activeCommand = command;
+
+
+  fetch("/command?move=" + command)
+  .catch(() => {});
+}
+
+
+function startCommand(command)
+{
+  sendCommand(command);
+
+
+  if (timer)
+  {
+    clearInterval(timer);
+  }
+
+
+  /*
+     Send command repeatedly.
+
+     This also acts as a heartbeat.
+  */
+
+  timer = setInterval(function()
+  {
+    sendCommand(activeCommand);
+
+  }, 200);
+
+
+  updateStatus(command);
+}
+
+
+function stopCommand()
+{
+  activeCommand = "stop";
+
+
+  if (timer)
+  {
+    clearInterval(timer);
+
+    timer = null;
+  }
+
+
+  sendCommand("stop");
+
+  updateStatus("STOP");
+}
+
+
+function updateStatus(text)
+{
+  document.getElementById("status").innerHTML =
+    text.toUpperCase();
+}
+
+
+/*
+   Keyboard control
+*/
+
+document.addEventListener("keydown", function(event)
+{
+
+  /*
+     Prevent repeated browser key events.
+  */
+
+  if (event.repeat)
+  {
+    return;
+  }
+
+
+  if (event.key === "w" ||
+      event.key === "W")
+  {
+    startCommand("forward");
+  }
+
+
+  else if (event.key === "s" ||
+           event.key === "S")
+  {
+    startCommand("backward");
+  }
+
+
+  else if (event.code === "Space")
+  {
+    event.preventDefault();
+
+    stopCommand();
+  }
+
+});
+
+
+/*
+   VERY IMPORTANT:
+   If the browser window loses focus,
+   request STOP.
+*/
+
+window.addEventListener("blur", function()
+{
+  stopCommand();
+});
+
+
+/*
+   If the page is closed or unloaded,
+   request STOP.
+*/
+
+window.addEventListener("beforeunload", function()
+{
+  navigator.sendBeacon("/command?move=stop");
+});
+
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+// =============================================================
+// 14. WEB SERVER: MAIN PAGE
+// =============================================================
+
+void handleRoot()
+{
+  server.send_P(
+    200,
+    "text/html",
+    MAIN_PAGE
+  );
+}
+
+
+// =============================================================
+// 15. WEB SERVER: COMMAND HANDLER
+// =============================================================
+
+void handleCommand()
+{
+  /*
+     Every valid command updates communication timer.
+  */
+
+  lastCommunication = millis();
+
+
+  if (!server.hasArg("move"))
+  {
+    requestedDirection = ROBOT_STOPPED;
+
+    server.send(
+      400,
+      "text/plain",
+      "Invalid command"
+    );
+
+    return;
+  }
+
+
+  String command = server.arg("move");
+
+
+  // -----------------------------------------------------------
+  // FORWARD
+  // -----------------------------------------------------------
+
+  if (command == "forward")
+  {
+    requestedDirection = ROBOT_FORWARD;
+
+    server.send(
+      200,
+      "text/plain",
+      "FORWARD"
+    );
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------
+  // BACKWARD
+  // -----------------------------------------------------------
+
+  if (command == "backward")
+  {
+    requestedDirection = ROBOT_BACKWARD;
+
+    server.send(
+      200,
+      "text/plain",
+      "BACKWARD"
+    );
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------
+  // STOP
+  // -----------------------------------------------------------
+
+  if (command == "stop")
+  {
+    requestedDirection = ROBOT_STOPPED;
+
+    server.send(
+      200,
+      "text/plain",
+      "STOP"
+    );
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------
+  // UNKNOWN COMMAND
+  // -----------------------------------------------------------
+
+  requestedDirection = ROBOT_STOPPED;
+
+
+  server.send(
+    400,
+    "text/plain",
+    "Unknown command"
+  );
+}
+
+
+// =============================================================
+// 16. SETUP
+// =============================================================
+
+void setup()
+{
+  /*
+     ----------------------------------------------------------
+     PIN INITIALIZATION
+     ----------------------------------------------------------
+  */
+
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+
+  /*
+     ----------------------------------------------------------
+     INITIAL SAFETY STATE
+     ----------------------------------------------------------
+
+     Motors OFF before anything else.
+  */
+
+  emergencyStop();
+
+
+  delay(1000);
+
+
+  /*
+     ----------------------------------------------------------
+     SERIAL
+     ----------------------------------------------------------
+  */
+
+  Serial.begin(115200);
+
+  delay(100);
+
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("ESP8266 ROBOT");
+  Serial.println("==============================");
+
+
+  /*
+     ----------------------------------------------------------
+     WI-FI ACCESS POINT
+     ----------------------------------------------------------
+
+     ESP8266 creates its own Wi-Fi network.
+  */
+
+  WiFi.mode(WIFI_AP);
+
+
+  IPAddress localIP(
+    192, 168, 4, 1
+  );
+
+
+  IPAddress gateway(
+    192, 168, 4, 1
+  );
+
+
+  IPAddress subnet(
+    255, 255, 255, 0
+  );
+
+
+  WiFi.softAPConfig(
+    localIP,
+    gateway,
+    subnet
+  );
+
+
+  WiFi.softAP(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+
+  Serial.println();
+
+  Serial.print("Wi-Fi SSID: ");
+
+  Serial.println(WIFI_SSID);
+
+
+  Serial.print("IP address: ");
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+
+  /*
+     ----------------------------------------------------------
+     WEB SERVER
+     ----------------------------------------------------------
+  */
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+
+  server.on(
+    "/command",
+    handleCommand
+  );
+
+
+  server.begin();
+
+
+  Serial.println(
+    "Web server started."
+  );
+
+
+  /*
+     ----------------------------------------------------------
+     INITIAL SAFETY TIMERS
+     ----------------------------------------------------------
+  */
+
+  lastCommunication = millis();
+
+  lastRampTime = millis();
+
+  directionStopTime = millis();
+
+
+  Serial.println(
+    "Robot is READY."
+  );
+
+  Serial.println(
+    "MOTORS ARE STOPPED."
+  );
+}
+
+
+// =============================================================
+// 17. MAIN LOOP
+// =============================================================
+
+void loop()
+{
+  /*
+     Process incoming Wi-Fi requests.
+  */
+
+  server.handleClient();
+
+
+  /*
+     ----------------------------------------------------------
+     WI-FI SAFETY TIMEOUT
+     ----------------------------------------------------------
+
+     If laptop stops sending commands/heartbeat,
+     robot automatically stops.
+
+     Example:
+
+     Laptop disconnected
+            ?
+       no heartbeat
+            ?
+        700 ms
+            ?
+          STOP
+  */
+
+  if (
+    millis() - lastCommunication
+    > WIFI_TIMEOUT
+  )
+  {
+    requestedDirection = ROBOT_STOPPED;
+  }
+
+
+  /*
+     ----------------------------------------------------------
+     MOVEMENT PROCESSING
+     ----------------------------------------------------------
+  */
+
+  processMovement();
+
+
+  /*
+     ----------------------------------------------------------
+     ESP8266 BACKGROUND TASK
+     ----------------------------------------------------------
+  */
+
+  yield();
+}
